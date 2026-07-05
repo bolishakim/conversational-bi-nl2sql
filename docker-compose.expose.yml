@@ -1,0 +1,111 @@
+# Docker Compose with Internet Exposure via Cloudflare Tunnel
+# ===========================================================
+#
+# This setup exposes your app to the internet so remote participants can access it.
+# Uses Cloudflare Tunnel (free, no account needed for quick tunnels).
+#
+# IMPORTANT: Quick tunnels generate random URLs each time.
+# For stable URLs, set up a Cloudflare account and use named tunnels.
+#
+# Usage:
+#   # Step 1: Start backend and its tunnel first
+#   docker-compose -f docker-compose.expose.yml up -d backend tunnel-backend
+#
+#   # Step 2: Wait 10 seconds, then get the backend URL
+#   docker logs thesis-tunnel-backend 2>&1 | grep -o 'https://[^[:space:]]*trycloudflare.com'
+#
+#   # Step 3: Set the backend URL and start frontend
+#   BACKEND_PUBLIC_URL=https://your-backend-url.trycloudflare.com \
+#   docker-compose -f docker-compose.expose.yml up -d frontend tunnel-frontend
+#
+#   # Step 4: Get the frontend URL to share with participants
+#   docker logs thesis-tunnel-frontend 2>&1 | grep -o 'https://[^[:space:]]*trycloudflare.com'
+#
+# Or use the helper script:
+#   ./docker-run.sh expose
+
+version: '3.8'
+
+services:
+  # ==========================================================================
+  # Backend API
+  # ==========================================================================
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: thesis-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_HOST=${DATABASE_HOST:-host.docker.internal}
+      - DATABASE_PORT=${DATABASE_PORT:-5432}
+      - DATABASE_NAME=${DATABASE_NAME:-Adventureworks}
+      - DATABASE_USER=${DATABASE_USER:-postgres}
+      - DATABASE_PASSWORD=${DATABASE_PASSWORD:-}
+      - REDIS_HOST=${REDIS_HOST:-host.docker.internal}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-your-secret-key}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - thesis-network
+
+  # ==========================================================================
+  # Frontend Web App
+  # ==========================================================================
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        - NEXT_PUBLIC_API_URL=${BACKEND_PUBLIC_URL:-http://localhost:8000}
+    container_name: thesis-frontend
+    ports:
+      - "3050:3050"
+    environment:
+      # Runtime env (used by entrypoint for rebuild if needed)
+      - NEXT_PUBLIC_API_URL=${BACKEND_PUBLIC_URL:-http://localhost:8000}
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - thesis-network
+
+  # ==========================================================================
+  # Cloudflare Tunnel for Backend
+  # ==========================================================================
+  tunnel-backend:
+    image: cloudflare/cloudflared:latest
+    container_name: thesis-tunnel-backend
+    command: tunnel --no-autoupdate --url http://backend:8000
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - thesis-network
+
+  # ==========================================================================
+  # Cloudflare Tunnel for Frontend
+  # ==========================================================================
+  tunnel-frontend:
+    image: cloudflare/cloudflared:latest
+    container_name: thesis-tunnel-frontend
+    command: tunnel --no-autoupdate --url http://frontend:3050
+    depends_on:
+      - frontend
+    restart: unless-stopped
+    networks:
+      - thesis-network
+
+networks:
+  thesis-network:
+    name: thesis-network

@@ -1,0 +1,258 @@
+"""
+RAG Retrieval System with Anchor Table Strategy
+Extracted from research prototype: rag_nl2sql_system
+"""
+from typing import List, Dict, Any
+from openai import OpenAI
+
+
+class RAGRetriever:
+    """Retrieve relevant tables using RAG + anchor table strategy"""
+
+    def __init__(
+        self,
+        openai_api_key: str,
+        embedding_model: str = "text-embedding-3-small",
+        top_k: int = 8,
+        enable_anchors: bool = True
+    ):
+        """
+        Initialize RAG retriever
+
+        Args:
+            openai_api_key: OpenAI API key for embeddings
+            embedding_model: Model to use for embeddings
+            top_k: Number of similar tables to retrieve
+            enable_anchors: Whether to use anchor table strategy
+        """
+        if not openai_api_key or openai_api_key == "your_openai_api_key_here":
+            raise ValueError("Valid OPENAI_API_KEY required")
+
+        self.client = OpenAI(api_key=openai_api_key)
+        self.embedding_model = embedding_model
+        self.top_k = top_k
+        self.enable_anchors = enable_anchors
+
+    def generate_query_embedding(self, query: str) -> List[float]:
+        """Generate embedding for user query"""
+        try:
+            response = self.client.embeddings.create(
+                model=self.embedding_model,
+                input=query,
+                encoding_format="float"
+            )
+            return response.data[0].embedding
+        except Exception as e:
+            print(f"Error generating query embedding: {e}")
+            raise
+
+    def get_anchor_tables(self, domain: str, anchor_tables_config: Dict[str, List[str]]) -> List[str]:
+        """Get anchor tables for a specific domain"""
+        if not self.enable_anchors:
+            return []
+        return anchor_tables_config.get(domain, anchor_tables_config.get("general", []))
+
+    def retrieve_similar_tables(
+        self,
+        query_embedding: List[float],
+        db_connection,
+        exclude_tables: List[str] = None,
+        k: int = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve similar tables using vector similarity search
+
+        Note: Due to pgvector IVFFlat index limitations with WHERE clauses,
+        we fetch extra results and filter in Python instead of SQL.
+        """
+        k = k or self.top_k
+        exclude_tables = exclude_tables or []
+        exclude_set = set(exclude_tables)
+
+        # Fetch more results than needed to account for exclusions
+        fetch_limit = k + len(exclude_tables) + 5  # Add buffer of 5
+
+        # Vector similarity search using pgvector
+        # NOTE: We do NOT use WHERE exclusion here because pgvector IVFFlat
+        # index has issues with WHERE clauses that can return 0 results
+        query = """
+            SELECT
+                schema_name,
+                table_name,
+                full_name,
+                description,
+                business_terms,
+                common_questions,
+                key_columns,
+                sample_values,
+                row_count,
+                tier,
+                embedding_text,
+                1 - (embedding <=> %s::vector) as similarity
+            FROM rag.table_embeddings
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s;
+        """
+
+        try:
+            results = db_connection.execute_query(
+                query,
+                (query_embedding, query_embedding, fetch_limit)
+            )
+
+            # Filter out excluded tables in Python
+            filtered_results = [
+                dict(row) for row in results
+                if row['full_name'] not in exclude_set
+            ]
+
+            # Return only top k after filtering
+            return filtered_results[:k]
+
+        except Exception as e:
+            print(f"Error retrieving similar tables: {e}")
+            return []
+
+    def get_table_details(self, table_names: List[str], db_connection) -> List[Dict[str, Any]]:
+        """Get full details for specific tables"""
+        if not table_names:
+            return []
+
+        placeholders = ', '.join(['%s'] * len(table_names))
+        query = f"""
+            SELECT
+                schema_name,
+                table_name,
+                full_name,
+                description,
+                business_terms,
+                common_questions,
+                key_columns,
+                sample_values,
+                row_count,
+                tier,
+                embedding_text
+            FROM rag.table_embeddings
+            WHERE full_name IN ({placeholders});
+        """
+
+        try:
+            results = db_connection.execute_query(query, tuple(table_names))
+            return [dict(row) for row in results]
+        except Exception as e:
+            print(f"Error getting table details: {e}")
+            return []
+
+    def retrieve_relevant_schema(
+        self,
+        user_query: str,
+        db_connection,
+        domain_detector,
+        anchor_tables_config: Dict[str, List[str]],
+        include_similarity_scores: bool = False,
+        conversation_history: List[Dict] = None
+    ) -> Dict[str, Any]:
+        """
+        Main retrieval function: Anchor tables + RAG-retrieved tables
+
+        Strategy:
+        1. Detect domain from query (with conversation history context)
+        2. Get anchor tables for that domain (always included)
+        3. Generate query embedding
+        4. Retrieve top-k similar tables (excluding anchors)
+        5. Combine anchors + retrieved tables
+
+        Args:
+            user_query: User's natural language query
+            db_connection: Database connection
+            domain_detector: DomainDetector instance
+            anchor_tables_config: Anchor table configuration
+            include_similarity_scores: Whether to include similarity scores
+            conversation_history: Optional conversation history for context
+        """
+        # Step 1: Detect domain (with conversation history for follow-up queries)
+        domain_info = domain_detector.get_domain_info(user_query, conversation_history)
+        primary_domain = domain_info["primary_domain"]
+        is_cross_dept = domain_info["is_cross_departmental"]
+
+        # Step 2: Get anchor tables
+        anchor_table_names = self.get_anchor_tables(primary_domain, anchor_tables_config)
+
+        # If cross-departmental, add anchors from other domains too
+        if is_cross_dept:
+            for other_domain in domain_info["all_domains"]:
+                if other_domain != primary_domain:
+                    other_anchors = self.get_anchor_tables(other_domain, anchor_tables_config)
+                    anchor_table_names.extend(other_anchors)
+
+        # Remove duplicates while preserving order
+        anchor_table_names = list(dict.fromkeys(anchor_table_names))
+
+        # Get anchor table details
+        anchor_tables = self.get_table_details(anchor_table_names, db_connection)
+
+        # Step 3: Generate query embedding
+        query_embedding = self.generate_query_embedding(user_query)
+
+        # Step 4: Retrieve similar tables (excluding anchors)
+        rag_retrieved = self.retrieve_similar_tables(
+            query_embedding,
+            db_connection,
+            exclude_tables=anchor_table_names,
+            k=self.top_k
+        )
+
+        # Step 5: Combine results
+        all_tables = anchor_tables + rag_retrieved
+
+        # Build result
+        result = {
+            "query": user_query,
+            "domain_info": domain_info,
+            "anchor_tables": [t["full_name"] for t in anchor_tables],
+            "rag_retrieved_tables": [t["full_name"] for t in rag_retrieved],
+            "all_tables": all_tables,
+            "total_tables": len(all_tables),
+            "strategy": "anchor + rag" if self.enable_anchors else "rag only"
+        }
+
+        if include_similarity_scores:
+            result["similarity_scores"] = {
+                t["full_name"]: t.get("similarity", 1.0)
+                for t in rag_retrieved
+            }
+
+        return result
+
+    def format_schema_context(self, tables: List[Dict[str, Any]]) -> str:
+        """
+        Format table metadata into a readable context for LLM
+        """
+        context_parts = ["# RELEVANT DATABASE SCHEMA\n"]
+
+        for i, table in enumerate(tables, 1):
+            context_parts.append(f"\n## Table {i}: {table['full_name']}")
+            context_parts.append(f"**Description:** {table['description']}")
+            context_parts.append(f"**Row Count:** {table['row_count']:,} rows")
+
+            # Add key columns
+            context_parts.append("\n**Key Columns:**")
+            import json
+            key_columns = json.loads(table['key_columns']) if isinstance(table['key_columns'], str) else table['key_columns']
+            for col_name, col_desc in key_columns.items():
+                context_parts.append(f"  - `{col_name}`: {col_desc}")
+
+            # Add business terms
+            terms = table['business_terms']
+            if terms:
+                context_parts.append(f"\n**Business Terms:** {', '.join(terms[:5])}")
+
+            # Add sample values if available
+            if table.get('sample_values'):
+                sample_values = json.loads(table['sample_values']) if isinstance(table['sample_values'], str) else table['sample_values']
+                if sample_values:
+                    context_parts.append("\n**Sample Values:**")
+                    for col, values in list(sample_values.items())[:2]:  # Show max 2 columns
+                        context_parts.append(f"  - {col}: {', '.join(str(v) for v in values[:3])}")
+
+        return "\n".join(context_parts)
