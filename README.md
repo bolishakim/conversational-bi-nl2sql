@@ -7,6 +7,19 @@ Master's thesis project (TU Graz) studying conversational Business Intelligence 
 - **Recruitment**: Prolific (completion code redirect built in)
 - **Author**: Bolis Hakim
 
+## Academic context
+
+This repository is the software artefact of a Master's thesis in the joint **Computational Social Systems (CSS)** programme of the **University of Graz** and **Graz University of Technology (TU Graz)**, submitted for the degree of Master of Science.
+
+- **Title**: Conversational Business Intelligence: An AI-Augmented Analytics Dashboard for Data-Driven Decision Making
+- **Author**: Bolis Hakim
+- **Degree**: MSc, Computational Social Systems (University of Graz / TU Graz)
+
+**Supervised by:**
+
+- Assoc.-Prof. Dr. Viktoria Pammer-Schindler — Institute of Human-Centred Computing, Graz University of Technology (TU Graz)
+- Univ.-Prof. Dr. Stefan Thalmann — Institute of Operations and Information Systems, University of Graz
+
 ## Stack
 
 | Layer | Tech |
@@ -166,4 +179,4 @@ DEBUG=true
 
 ## Repository
 
-https://github.com/bolishakim/thesis-nl2sql-chatbot
+https://github.com/bolishakim/conversational-bi-nl2sql
